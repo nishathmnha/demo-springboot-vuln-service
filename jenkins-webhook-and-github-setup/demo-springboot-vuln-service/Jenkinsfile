@@ -8,26 +8,48 @@ pipeline {
     HOST_PORT = '8082'
     DOCKER_BIN = 'docker'
     TRIVY_IMAGE = 'aquasec/trivy:0.57.1'
+    LOG_DIR = 'pipeline-logs'
+    WEBHOOK_URL = 'http://host.docker.internal:8000/api/v1/webhooks/jenkins/failure'
+    WEBHOOK_SECRET = 'change-me'
+    SOURCE_BRANCH = 'main'
+    REPO_NAME = 'nishathmnha/demo-springboot-vuln-service'
   }
 
   stages {
     stage('Show Environment') {
       steps {
-        sh 'echo "PATH=$PATH"'
-        sh 'command -v ${DOCKER_BIN}'
-        sh '${DOCKER_BIN} version'
-        sh 'test -f ${APP_REPO}/pom.xml'
-        sh 'test -f ${APP_REPO}/Dockerfile'
+        sh '''
+          mkdir -p "${LOG_DIR}"
+          rm -f "${LOG_DIR}"/*.log
+
+          (
+            echo "PATH=$PATH"
+            command -v ${DOCKER_BIN}
+            ${DOCKER_BIN} version
+            test -f ${APP_REPO}/pom.xml
+            test -f ${APP_REPO}/Dockerfile
+          ) > "${LOG_DIR}/show-environment.log" 2>&1
+
+          status=$?
+          cat "${LOG_DIR}/show-environment.log"
+          exit $status
+        '''
       }
     }
 
     stage('Build Spring Boot Image') {
       steps {
         sh '''
-          ${DOCKER_BIN} build \
-            -t ${IMAGE_NAME}:${BUILD_NUMBER} \
-            -t ${IMAGE_NAME}:latest \
-            ${APP_REPO}
+          (
+            ${DOCKER_BIN} build \
+              -t ${IMAGE_NAME}:${BUILD_NUMBER} \
+              -t ${IMAGE_NAME}:latest \
+              ${APP_REPO}
+          ) > "${LOG_DIR}/build-image.log" 2>&1
+
+          status=$?
+          cat "${LOG_DIR}/build-image.log"
+          exit $status
         '''
       }
     }
@@ -35,12 +57,18 @@ pipeline {
     stage('Scan Image') {
       steps {
         sh '''
-          ${DOCKER_BIN} run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            ${TRIVY_IMAGE} image \
-            --severity HIGH,CRITICAL \
-            --exit-code 1 \
-            ${IMAGE_NAME}:${BUILD_NUMBER}
+          (
+            ${DOCKER_BIN} run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              ${TRIVY_IMAGE} image \
+              --severity HIGH,CRITICAL \
+              --exit-code 1 \
+              ${IMAGE_NAME}:${BUILD_NUMBER}
+          ) > "${LOG_DIR}/scan-image.log" 2>&1
+
+          status=$?
+          cat "${LOG_DIR}/scan-image.log"
+          exit $status
         '''
       }
     }
@@ -48,19 +76,33 @@ pipeline {
     stage('Deploy Container') {
       steps {
         sh '''
-          ${DOCKER_BIN} rm -f ${CONTAINER_NAME} || true
-          ${DOCKER_BIN} run -d \
-            --name ${CONTAINER_NAME} \
-            -p ${HOST_PORT}:8080 \
-            ${IMAGE_NAME}:${BUILD_NUMBER}
+          (
+            ${DOCKER_BIN} rm -f ${CONTAINER_NAME} || true
+            ${DOCKER_BIN} run -d \
+              --name ${CONTAINER_NAME} \
+              -p ${HOST_PORT}:8080 \
+              ${IMAGE_NAME}:${BUILD_NUMBER}
+          ) > "${LOG_DIR}/deploy-container.log" 2>&1
+
+          status=$?
+          cat "${LOG_DIR}/deploy-container.log"
+          exit $status
         '''
       }
     }
 
     stage('Verify Deployment') {
       steps {
-        sh 'sleep 8'
-        sh 'curl --fail http://host.docker.internal:${HOST_PORT}/health'
+        sh '''
+          (
+            sleep 8
+            curl --fail http://host.docker.internal:${HOST_PORT}/health
+          ) > "${LOG_DIR}/verify-deployment.log" 2>&1
+
+          status=$?
+          cat "${LOG_DIR}/verify-deployment.log"
+          exit $status
+        '''
       }
     }
   }
@@ -70,7 +112,62 @@ pipeline {
       echo "Deployment succeeded. Open http://localhost:8082/health on your machine."
     }
     failure {
-      sh 'command -v ${DOCKER_BIN} >/dev/null 2>&1 && ${DOCKER_BIN} logs ${CONTAINER_NAME} || true'
+      sh '''
+        mkdir -p "${LOG_DIR}"
+        if command -v ${DOCKER_BIN} >/dev/null 2>&1; then
+          ${DOCKER_BIN} logs ${CONTAINER_NAME} > "${LOG_DIR}/container.log" 2>&1 || true
+        fi
+      '''
+      script {
+        def logFiles = [
+          'show-environment.log',
+          'build-image.log',
+          'scan-image.log',
+          'deploy-container.log',
+          'verify-deployment.log',
+          'container.log',
+        ]
+
+        def consoleSections = []
+        logFiles.each { logFile ->
+          def path = "${env.LOG_DIR}/${logFile}"
+          if (fileExists(path)) {
+            consoleSections << "===== ${logFile} =====\n${readFile(path)}"
+          }
+        }
+
+        def consoleText = consoleSections.join('\n\n')
+        int maxConsoleChars = 60000
+        if (consoleText.length() > maxConsoleChars) {
+          consoleText = "[truncated to last ${maxConsoleChars} characters]\n" +
+            consoleText.substring(consoleText.length() - maxConsoleChars)
+        }
+
+        def payload = [
+          job_name: env.JOB_NAME,
+          build_number: env.BUILD_NUMBER.toInteger(),
+          build_url: env.BUILD_URL,
+          console_url: "${env.BUILD_URL}consoleText",
+          branch: env.SOURCE_BRANCH,
+          repo: env.REPO_NAME,
+          status: 'FAILED',
+          deployment_environment: 'local',
+          docker_image: "${env.IMAGE_NAME}:${env.BUILD_NUMBER}",
+          local_repo_path: env.APP_REPO,
+          console_text: consoleText,
+        ]
+
+        writeFile(
+          file: 'webhook_payload.json',
+          text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(payload)),
+        )
+      }
+      sh '''
+        curl --fail --show-error -X POST "${WEBHOOK_URL}" \
+          -H "Content-Type: application/json" \
+          -H "X-Webhook-Secret: ${WEBHOOK_SECRET}" \
+          --data @webhook_payload.json
+      '''
       echo 'Build failed. If the failure is in Scan Image, that is expected for the vulnerable demo.'
     }
   }
