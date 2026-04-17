@@ -6,7 +6,7 @@ pipeline {
     IMAGE_NAME = 'local/demo-springboot-vuln-service'
     CONTAINER_NAME = 'demo-springboot-vuln-service'
     HOST_PORT = '8082'
-    DOCKER_BIN = '/usr/bin/docker'
+    DOCKER_BIN = 'docker'
     TRIVY_IMAGE = 'aquasec/trivy:0.57.1'
   }
 
@@ -14,7 +14,7 @@ pipeline {
     stage('Show Environment') {
       steps {
         sh 'echo "PATH=$PATH"'
-        sh 'test -x ${DOCKER_BIN}'
+        sh 'command -v ${DOCKER_BIN}'
         sh '${DOCKER_BIN} version'
         sh 'test -f ${APP_REPO}/pom.xml'
         sh 'test -f ${APP_REPO}/Dockerfile'
@@ -70,7 +70,7 @@ pipeline {
       echo "Deployment succeeded. Open http://localhost:8082/health on your machine."
     }
     failure {
-      sh '${DOCKER_BIN} logs ${CONTAINER_NAME} || true'
+      sh 'command -v ${DOCKER_BIN} >/dev/null 2>&1 && ${DOCKER_BIN} logs ${CONTAINER_NAME} || true'
       echo 'Build failed. If the failure is in Scan Image, that is expected for the vulnerable demo.'
     }
   }
