@@ -1,0 +1,77 @@
+pipeline {
+  agent any
+
+  environment {
+    APP_REPO = '/workspace/demo-springboot-vuln-service'
+    IMAGE_NAME = 'local/demo-springboot-vuln-service'
+    CONTAINER_NAME = 'demo-springboot-vuln-service'
+    HOST_PORT = '8082'
+    DOCKER_BIN = '/usr/bin/docker'
+    TRIVY_IMAGE = 'aquasec/trivy:0.57.1'
+  }
+
+  stages {
+    stage('Show Environment') {
+      steps {
+        sh 'echo "PATH=$PATH"'
+        sh 'test -x ${DOCKER_BIN}'
+        sh '${DOCKER_BIN} version'
+        sh 'test -f ${APP_REPO}/pom.xml'
+        sh 'test -f ${APP_REPO}/Dockerfile'
+      }
+    }
+
+    stage('Build Spring Boot Image') {
+      steps {
+        sh '''
+          ${DOCKER_BIN} build \
+            -t ${IMAGE_NAME}:${BUILD_NUMBER} \
+            -t ${IMAGE_NAME}:latest \
+            ${APP_REPO}
+        '''
+      }
+    }
+
+    stage('Scan Image') {
+      steps {
+        sh '''
+          ${DOCKER_BIN} run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            ${TRIVY_IMAGE} image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            ${IMAGE_NAME}:${BUILD_NUMBER}
+        '''
+      }
+    }
+
+    stage('Deploy Container') {
+      steps {
+        sh '''
+          ${DOCKER_BIN} rm -f ${CONTAINER_NAME} || true
+          ${DOCKER_BIN} run -d \
+            --name ${CONTAINER_NAME} \
+            -p ${HOST_PORT}:8080 \
+            ${IMAGE_NAME}:${BUILD_NUMBER}
+        '''
+      }
+    }
+
+    stage('Verify Deployment') {
+      steps {
+        sh 'sleep 8'
+        sh 'curl --fail http://host.docker.internal:${HOST_PORT}/health'
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Deployment succeeded. Open http://localhost:8082/health on your machine."
+    }
+    failure {
+      sh '${DOCKER_BIN} logs ${CONTAINER_NAME} || true'
+      echo 'Build failed. If the failure is in Scan Image, that is expected for the vulnerable demo.'
+    }
+  }
+}
