@@ -1,0 +1,21 @@
+services:
+  jenkins:
+    image: local-jenkins-custom:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: local-jenkins
+    user: root
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../demo-python-service:/workspace/demo-python-service
+      - ../demo-springboot-vuln-service:/workspace/demo-springboot-vuln-service
+
+volumes:
+  jenkins_home:
