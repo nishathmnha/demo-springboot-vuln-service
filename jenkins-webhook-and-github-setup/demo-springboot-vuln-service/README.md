@@ -25,16 +25,22 @@ curl http://localhost:8082/health
 
 The included `Jenkinsfile`:
 
-1. checks Docker availability
-2. builds the Spring Boot container image
-3. deploys the container locally
-4. verifies the health endpoint
-5. runs a lighter Trivy vulnerability analysis using cached data where possible
-6. keeps the build successful even if the analysis finds vulnerabilities
+1. uses Spring Boot source already checked out in the Jenkins workspace when available
+2. can optionally try a remote GitHub clone when `PREFER_REMOTE_CLONE=true`
+3. falls back to the locally mounted Spring Boot source for the local Jenkins demo
+4. checks Docker availability
+5. builds the Spring Boot container image
+6. deploys the container locally
+7. verifies the deployment through a configured health check URL when one is reachable
+8. runs a straightforward Trivy container scan against the built image
+9. fails the job when `HIGH` or `CRITICAL` vulnerabilities are found
 
-The lighter analysis is tuned for local iteration:
+The lightweight scan is tuned for local iteration:
 
 - uses only Trivy vulnerability scanning
 - ignores unfixed findings
 - limits output to `HIGH` and `CRITICAL`
-- avoids failing the local deployment job
+- reuses cached DB data automatically after the first run
+- avoids waiting on a remote clone in offline/local Docker setups
+- skips webhook delivery unless `WEBHOOK_URL` is explicitly set
+- keeps the deployment/build flow simple while still enforcing a vulnerability gate

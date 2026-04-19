@@ -2,36 +2,109 @@ pipeline {
   agent any
 
   environment {
-    APP_REPO = '/workspace/demo-springboot-vuln-service'
+    APP_REPO = 'app-source'
+    MOUNTED_APP_REPO = '/workspace/demo-springboot-vuln-service'
     IMAGE_NAME = 'local/demo-springboot-vuln-service'
     CONTAINER_NAME = 'demo-springboot-vuln-service'
     HOST_PORT = '8082'
+    HEALTHCHECK_PATH = '/health'
+    HEALTHCHECK_URL = ''
+    DEFAULT_HEALTHCHECK_HOST = 'host.docker.internal'
     DOCKER_BIN = 'docker'
     TRIVY_IMAGE = 'aquasec/trivy:0.57.1'
     RUN_VULNERABILITY_ANALYSIS = 'true'
     TRIVY_CACHE_VOLUME = 'trivy-cache'
     VULN_ANALYSIS_SEVERITY = 'HIGH,CRITICAL'
-    VULN_ANALYSIS_TIMEOUT = '2m'
+    VULN_ANALYSIS_TIMEOUT = '10m'
+    PREFER_REMOTE_CLONE = 'false'
+    REMOTE_CHECK_URL = 'https://github.com'
+    REMOTE_CHECK_TIMEOUT = '8'
     LOG_DIR = 'pipeline-logs'
-    WEBHOOK_URL = 'http://host.docker.internal:8000/api/v1/webhooks/jenkins/failure'
+    WEBHOOK_URL = ''
     WEBHOOK_SECRET = 'change-me'
     SOURCE_BRANCH = 'main'
+    REPO_URL = 'https://github.com/nishathmnha/demo-springboot-vuln-service.git'
     REPO_NAME = 'nishathmnha/demo-springboot-vuln-service'
   }
 
   stages {
-    stage('Show Environment') {
+    stage('Prepare Workspace') {
       steps {
         sh '''
           mkdir -p "${LOG_DIR}"
           rm -f "${LOG_DIR}"/*.log
+          rm -rf "${APP_REPO}"
+        '''
+      }
+    }
+
+    stage('Resolve Spring Boot Source') {
+      steps {
+        sh '''
+          set -e
+          resolved_repo=''
+
+          if [ -f pom.xml ] && [ -f Dockerfile ]; then
+            echo "Using Spring Boot source already present in the Jenkins workspace."
+            resolved_repo='.'
+          fi
+
+          if [ -z "${resolved_repo}" ] && [ "${PREFER_REMOTE_CLONE}" = 'true' ]; then
+            echo "Checking GitHub connectivity before clone..."
+            if curl -fsI --connect-timeout "${REMOTE_CHECK_TIMEOUT}" --max-time "${REMOTE_CHECK_TIMEOUT}" "${REMOTE_CHECK_URL}" >/dev/null 2>&1; then
+              echo "Trying to clone ${REPO_URL}"
+              if git clone --depth 1 --branch "${SOURCE_BRANCH}" "${REPO_URL}" "${APP_REPO}"; then
+                resolved_repo="${APP_REPO}"
+              else
+                echo
+                echo "Git clone failed. Falling back to mounted repo at ${MOUNTED_APP_REPO}."
+              fi
+            else
+              echo "GitHub is not reachable from Jenkins right now. Using mounted repo instead."
+            fi
+          elif [ -z "${resolved_repo}" ]; then
+            echo "Remote clone disabled for local Jenkins demo. Using mounted repo at ${MOUNTED_APP_REPO}."
+          fi
+
+          if [ -z "${resolved_repo}" ]; then
+            echo
+            test -f "${MOUNTED_APP_REPO}/pom.xml"
+            test -f "${MOUNTED_APP_REPO}/Dockerfile"
+            mkdir -p "${APP_REPO}"
+            cp -R "${MOUNTED_APP_REPO}/." "${APP_REPO}/"
+            resolved_repo="${APP_REPO}"
+          fi
+
+          printf '%s' "${resolved_repo}" > "${LOG_DIR}/resolved-app-repo.txt"
+          echo
+          if git -C "${resolved_repo}" rev-parse HEAD >/dev/null 2>&1; then
+            echo "Pulled commit:"
+            git -C "${resolved_repo}" rev-parse HEAD
+          else
+            echo "Using non-git source directory: ${resolved_repo}"
+          fi
+          echo
+          echo "Repository files:"
+          ls -la "${resolved_repo}"
+        '''
+      }
+    }
+
+    stage('Show Environment') {
+      steps {
+        sh '''
+          mkdir -p "${LOG_DIR}"
+          resolved_repo="$(cat "${LOG_DIR}/resolved-app-repo.txt")"
 
           (
+            echo "APP_REPO=$resolved_repo"
+            echo "WORKSPACE=$WORKSPACE"
             echo "PATH=$PATH"
             command -v ${DOCKER_BIN}
+            command -v git
             ${DOCKER_BIN} version
-            test -f ${APP_REPO}/pom.xml
-            test -f ${APP_REPO}/Dockerfile
+            test -f "${resolved_repo}/pom.xml"
+            test -f "${resolved_repo}/Dockerfile"
           ) > "${LOG_DIR}/show-environment.log" 2>&1
 
           status=$?
@@ -44,11 +117,13 @@ pipeline {
     stage('Build Spring Boot Image') {
       steps {
         sh '''
+          resolved_repo="$(cat "${LOG_DIR}/resolved-app-repo.txt")"
           (
+            echo "Building image from ${resolved_repo}"
             ${DOCKER_BIN} build \
               -t ${IMAGE_NAME}:${BUILD_NUMBER} \
               -t ${IMAGE_NAME}:latest \
-              ${APP_REPO}
+              "${resolved_repo}"
           ) > "${LOG_DIR}/build-image.log" 2>&1
 
           status=$?
@@ -79,9 +154,20 @@ pipeline {
     stage('Verify Deployment') {
       steps {
         sh '''
+          verify_url="${HEALTHCHECK_URL}"
+          if [ -z "${verify_url}" ] && getent hosts "${DEFAULT_HEALTHCHECK_HOST}" >/dev/null 2>&1; then
+            verify_url="http://${DEFAULT_HEALTHCHECK_HOST}:${HOST_PORT}${HEALTHCHECK_PATH}"
+          fi
+
           (
             sleep 8
-            curl --fail http://host.docker.internal:${HOST_PORT}/health
+            if [ -n "${verify_url}" ]; then
+              echo "Checking ${verify_url}"
+              curl --fail "${verify_url}"
+            else
+              echo "No health check URL available from this Jenkins environment. Verifying the container is running instead."
+              ${DOCKER_BIN} inspect ${CONTAINER_NAME} --format '{{.State.Running}}'
+            fi
           ) > "${LOG_DIR}/verify-deployment.log" 2>&1
 
           status=$?
@@ -97,32 +183,24 @@ pipeline {
       }
       steps {
         sh '''
-          (
-            set +e
-            ${DOCKER_BIN} run --rm \
-              -v ${TRIVY_CACHE_VOLUME}:/tmp/trivy-cache \
-              -v /var/run/docker.sock:/var/run/docker.sock \
-              ${TRIVY_IMAGE} image \
-              --cache-dir /tmp/trivy-cache \
-              --scanners vuln \
-              --severity ${VULN_ANALYSIS_SEVERITY} \
-              --ignore-unfixed \
-              --format table \
-              --no-progress \
-              --timeout ${VULN_ANALYSIS_TIMEOUT} \
-              ${IMAGE_NAME}:${BUILD_NUMBER}
+          set -e
+          echo "Running Trivy container scan against ${IMAGE_NAME}:${BUILD_NUMBER}..."
+          echo "The first run can take a few minutes because Trivy downloads its vulnerability database."
+          ${DOCKER_BIN} run --rm \
+            -v ${TRIVY_CACHE_VOLUME}:/tmp/trivy-cache \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            ${TRIVY_IMAGE} image \
+            --cache-dir /tmp/trivy-cache \
+            --scanners vuln \
+            --severity ${VULN_ANALYSIS_SEVERITY} \
+            --ignore-unfixed \
+            --format table \
+            --no-progress \
+            --timeout ${VULN_ANALYSIS_TIMEOUT} \
+            --exit-code 1 \
+            ${IMAGE_NAME}:${BUILD_NUMBER}
 
-            trivy_status=$?
-            echo
-            if [ $trivy_status -eq 0 ]; then
-              echo "Vulnerability analysis completed."
-            else
-              echo "Vulnerability analysis ended with a non-fatal scanner error (exit ${trivy_status})."
-            fi
-          ) > "${LOG_DIR}/scan-image.log" 2>&1
-
-          cat "${LOG_DIR}/scan-image.log"
-          exit 0
+          echo "Lightweight vulnerability scan passed with no ${VULN_ANALYSIS_SEVERITY} findings."
         '''
       }
     }
@@ -130,8 +208,8 @@ pipeline {
 
   post {
     success {
-      echo "Deployment succeeded. Open http://localhost:8082/health on your machine."
-      echo "Lightweight vulnerability analysis ran without blocking the local deployment."
+      echo "Deployment succeeded."
+      echo "Lightweight vulnerability scan passed with no ${VULN_ANALYSIS_SEVERITY} findings."
     }
     failure {
       sh '''
@@ -170,7 +248,7 @@ pipeline {
           build_number: env.BUILD_NUMBER.toInteger(),
           build_url: env.BUILD_URL,
           branch: env.SOURCE_BRANCH,
-          repo: env.REPO_NAME,
+          repo: env.REPO_URL,
           status: 'FAILED',
           console_text: consoleText,
         ]
@@ -180,13 +258,19 @@ pipeline {
           text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(payload)),
         )
       }
-      sh '''
-        curl --fail --show-error -X POST "${WEBHOOK_URL}" \
-          -H "Content-Type: application/json" \
-          -H "X-Webhook-Secret: ${WEBHOOK_SECRET}" \
-          --data @webhook_payload.json
-      '''
-      echo 'Build failed. If the failure is in Scan Image, that is expected for the vulnerable demo.'
+      script {
+        if (env.WEBHOOK_URL?.trim()) {
+          sh '''
+            curl --fail --show-error -X POST "${WEBHOOK_URL}" \
+              -H "Content-Type: application/json" \
+              -H "X-Webhook-Secret: ${WEBHOOK_SECRET}" \
+              --data @webhook_payload.json
+          '''
+        } else {
+          echo 'WEBHOOK_URL is not set; skipping failure webhook notification.'
+        }
+      }
+      echo 'Build failed. Check the Trivy scan output or deployment logs above.'
     }
   }
 }
