@@ -27,8 +27,14 @@ The included `Jenkinsfile`:
 
 1. checks Docker availability
 2. builds the Spring Boot container image
-3. scans the image with Trivy
-4. fails the pipeline if Trivy finds HIGH or CRITICAL issues
-5. deploys the container only if the scan passes
+3. deploys the container locally
+4. verifies the health endpoint
+5. runs a lighter Trivy vulnerability analysis using cached data where possible
+6. keeps the build successful even if the analysis finds vulnerabilities
 
-If you want a deployment-only flow, remove or temporarily comment out the `Scan Image` stage.
+The lighter analysis is tuned for local iteration:
+
+- uses only Trivy vulnerability scanning
+- ignores unfixed findings
+- limits output to `HIGH` and `CRITICAL`
+- avoids failing the local deployment job

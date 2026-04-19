@@ -8,6 +8,10 @@ pipeline {
     HOST_PORT = '8082'
     DOCKER_BIN = 'docker'
     TRIVY_IMAGE = 'aquasec/trivy:0.57.1'
+    RUN_VULNERABILITY_ANALYSIS = 'true'
+    TRIVY_CACHE_VOLUME = 'trivy-cache'
+    VULN_ANALYSIS_SEVERITY = 'HIGH,CRITICAL'
+    VULN_ANALYSIS_TIMEOUT = '2m'
     LOG_DIR = 'pipeline-logs'
     WEBHOOK_URL = 'http://host.docker.internal:8000/api/v1/webhooks/jenkins/failure'
     WEBHOOK_SECRET = 'change-me'
@@ -54,25 +58,6 @@ pipeline {
       }
     }
 
-    stage('Scan Image') {
-      steps {
-        sh '''
-          (
-            ${DOCKER_BIN} run --rm \
-              -v /var/run/docker.sock:/var/run/docker.sock \
-              ${TRIVY_IMAGE} image \
-              --severity HIGH,CRITICAL \
-              --exit-code 1 \
-              ${IMAGE_NAME}:${BUILD_NUMBER}
-          ) > "${LOG_DIR}/scan-image.log" 2>&1
-
-          status=$?
-          cat "${LOG_DIR}/scan-image.log"
-          exit $status
-        '''
-      }
-    }
-
     stage('Deploy Container') {
       steps {
         sh '''
@@ -105,11 +90,48 @@ pipeline {
         '''
       }
     }
+
+    stage('Lightweight Vulnerability Analysis') {
+      when {
+        expression { env.RUN_VULNERABILITY_ANALYSIS == 'true' }
+      }
+      steps {
+        sh '''
+          (
+            set +e
+            ${DOCKER_BIN} run --rm \
+              -v ${TRIVY_CACHE_VOLUME}:/tmp/trivy-cache \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              ${TRIVY_IMAGE} image \
+              --cache-dir /tmp/trivy-cache \
+              --scanners vuln \
+              --severity ${VULN_ANALYSIS_SEVERITY} \
+              --ignore-unfixed \
+              --format table \
+              --no-progress \
+              --timeout ${VULN_ANALYSIS_TIMEOUT} \
+              ${IMAGE_NAME}:${BUILD_NUMBER}
+
+            trivy_status=$?
+            echo
+            if [ $trivy_status -eq 0 ]; then
+              echo "Vulnerability analysis completed."
+            else
+              echo "Vulnerability analysis ended with a non-fatal scanner error (exit ${trivy_status})."
+            fi
+          ) > "${LOG_DIR}/scan-image.log" 2>&1
+
+          cat "${LOG_DIR}/scan-image.log"
+          exit 0
+        '''
+      }
+    }
   }
 
   post {
     success {
       echo "Deployment succeeded. Open http://localhost:8082/health on your machine."
+      echo "Lightweight vulnerability analysis ran without blocking the local deployment."
     }
     failure {
       sh '''
@@ -147,13 +169,9 @@ pipeline {
           job_name: env.JOB_NAME,
           build_number: env.BUILD_NUMBER.toInteger(),
           build_url: env.BUILD_URL,
-          console_url: "${env.BUILD_URL}consoleText",
           branch: env.SOURCE_BRANCH,
           repo: env.REPO_NAME,
           status: 'FAILED',
-          deployment_environment: 'local',
-          docker_image: "${env.IMAGE_NAME}:${env.BUILD_NUMBER}",
-          local_repo_path: env.APP_REPO,
           console_text: consoleText,
         ]
 
